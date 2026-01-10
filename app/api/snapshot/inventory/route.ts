@@ -57,7 +57,7 @@ async function fetchVariantBySkuGraphQL(params: {
     }
   `;
 
-  const variables = { query: `sku:${sku}` };
+  const variables = { query: `sku:"${sku}"` };
 
   const res = await fetch(
     `https://${shopDomain}/admin/api/${apiVersion}/graphql.json`,
