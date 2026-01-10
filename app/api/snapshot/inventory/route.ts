@@ -37,12 +37,15 @@ export async function GET(req: Request) {
   const runId = `${snapshotDate}-${Date.now()}`;
 
   // --- Google Sheets auth ---
-  const auth = new google.auth.JWT(
-    process.env.GOOGLE_CLIENT_EMAIL,
-    undefined,
-    process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
+  const auth = new google.auth.JWT({
+    email: process.env.GOOGLE_CLIENT_EMAIL,
+    key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+    scopes: [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive.file",
+    ],
+  });
+
 
   const sheets = google.sheets({ version: "v4", auth });
 
