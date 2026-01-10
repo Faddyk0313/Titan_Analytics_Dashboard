@@ -70,6 +70,7 @@ async function fetchVariantBySkuGraphQL(params: {
       body: JSON.stringify({ query, variables }),
     }
   );
+  
 
   if (!res.ok) return null;
 
@@ -224,7 +225,7 @@ export async function POST(req: Request) {
         errors.push({
           sku,
           stage: "variant_lookup",
-          detail: "Variant not found by SKU via GraphQL",
+          detail: `Variant not found by SKU via GraphQL (query sku:"${sku}")`,
         });
         continue;
       }
