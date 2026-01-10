@@ -72,7 +72,12 @@ async function fetchVariantBySkuGraphQL(params: {
   );
   
 
-  if (!res.ok) return null;
+  // if (!res.ok) return null;
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Shopify GraphQL error ${res.status}: ${text}`);
+  }
+  
 
   const json = (await res.json()) as any;
   const edge = json?.data?.productVariants?.edges?.[0];
