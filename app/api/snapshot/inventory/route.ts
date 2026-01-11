@@ -3,9 +3,16 @@ import { google } from "googleapis";
 
 const TZ = "America/New_York";
 
-// Include header row so we can map columns safely
+// Read Summary with header row so we can map columns safely
 const SKU_DEFS_RANGE = "Summary!A1:Z";
 const SNAPSHOT_SHEET = "inventory_snapshots";
+
+// Hardcoded weights (matches Andries tables)
+const PRODUCT_CLASS_WEIGHT: Record<string, number> = { A: 4, B: 3, C: 2, LE: 1 };
+const SIZE_CLASS_WEIGHT: Record<string, number> = { A: 3, B: 1 };
+
+// Core sizes => Size Class A, everything else => B
+const SIZE_CLASS_A_SET = new Set(["YTH-MD", "YTH-LG", "YTH-XL", "SR-SM", "SR-MD", "SR-LG"]);
 
 function getETDate() {
   return new Intl.DateTimeFormat("en-CA", {
@@ -67,141 +74,190 @@ function getByHeader(
   return undefined;
 }
 
-// Andries product class weights
-const PRODUCT_CLASS_WEIGHT: Record<string, number> = {
-  A: 4,
-  B: 3,
-  C: 2,
-  LE: 1,
-};
-
-// Andries size class weights
-const SIZE_CLASS_WEIGHT: Record<string, number> = {
-  A: 3,
-  B: 1,
-};
-
-// Derive Size Class from Size because Summary does not have a Size Class column
-const SIZE_CLASS_A_SET = new Set([
-  "YTH-MD",
-  "YTH-LG",
-  "YTH-XL",
-  "SR-SM",
-  "SR-MD",
-  "SR-LG",
-]);
-
 function deriveSizeClassFromSize(sizeRaw: string): "A" | "B" {
   const size = (sizeRaw || "").toString().trim().toUpperCase();
   return SIZE_CLASS_A_SET.has(size) ? "A" : "B";
 }
 
-// More reliable than /variants.json?sku=... : use Admin GraphQL search query by SKU
-async function fetchVariantBySkuGraphQL(params: {
+function chunk<T>(arr: T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+async function shopifyGraphQL(params: {
   shopDomain: string;
   adminToken: string;
   apiVersion: string;
-  sku: string;
-}): Promise<{ variantId: string; inventoryItemId: string } | null> {
-  const { shopDomain, adminToken, apiVersion, sku } = params;
+  query: string;
+  variables?: any;
+}) {
+  const { shopDomain, adminToken, apiVersion, query, variables } = params;
 
-  const query = `
-    query VariantBySku($query: String!) {
-      productVariants(first: 1, query: $query) {
-        edges {
-          node {
-            id
-            inventoryItem {
-              id
-            }
-          }
-        }
-      }
-    }
-  `;
-
-  const variables = { query: `sku:"${sku}"` };
-
-  const res = await fetch(
-    `https://${shopDomain}/admin/api/${apiVersion}/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "X-Shopify-Access-Token": adminToken,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ query, variables }),
-    }
-  );
+  const res = await fetch(`https://${shopDomain}/admin/api/${apiVersion}/graphql.json`, {
+    method: "POST",
+    headers: {
+      "X-Shopify-Access-Token": adminToken,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Shopify GraphQL error ${res.status}: ${text}`);
   }
 
-  const json = (await res.json()) as any;
-  const edge = json?.data?.productVariants?.edges?.[0];
-  const node = edge?.node;
-
-  const variantGid = node?.id as string | undefined;
-  const invItemGid = node?.inventoryItem?.id as string | undefined;
-
-  if (!variantGid || !invItemGid) return null;
-
-  const variantId = variantGid.split("/").pop()!;
-  const inventoryItemId = invItemGid.split("/").pop()!;
-
-  return { variantId, inventoryItemId };
+  return (await res.json()) as any;
 }
 
-async function fetchAvailableInventoryREST(params: {
+async function fetchAllVariants(params: {
   shopDomain: string;
   adminToken: string;
   apiVersion: string;
-  inventoryItemId: string;
-  locationId: string;
-}): Promise<number> {
-  const { shopDomain, adminToken, apiVersion, inventoryItemId, locationId } =
-    params;
+}) {
+  const { shopDomain, adminToken, apiVersion } = params;
 
-  const res = await fetch(
-    `https://${shopDomain}/admin/api/${apiVersion}/inventory_levels.json?inventory_item_ids=${encodeURIComponent(
-      inventoryItemId
-    )}&location_ids=${encodeURIComponent(locationId)}`,
-    {
+  // Pull all variants (about 1,000) with SKU, product name, variant id, inventory item id
+  const query = `
+    query Variants($first: Int!, $after: String) {
+      productVariants(first: $first, after: $after, query: "product_status:active") {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id
+            sku
+            title
+            product { title }
+            inventoryItem { id }
+          }
+        }
+      }
+    }
+  `;
+
+  const all: Array<{
+    sku: string;
+    productName: string;
+    variantId: string;
+    inventoryItemId: string;
+  }> = [];
+
+  let after: string | null = null;
+  const first = 250;
+
+  while (true) {
+    const json = await shopifyGraphQL({
+      shopDomain,
+      adminToken,
+      apiVersion,
+      query,
+      variables: { first, after },
+    });
+
+    const conn = json?.data?.productVariants;
+    const edges = conn?.edges || [];
+
+    for (const e of edges) {
+      const n = e?.node;
+      const sku = (n?.sku || "").toString().trim();
+      if (!sku) continue; // skip variants without SKU, since our join key is SKU
+
+      const variantGid = n?.id as string;
+      const invItemGid = n?.inventoryItem?.id as string;
+
+      const variantId = variantGid?.split("/").pop() || "";
+      const inventoryItemId = invItemGid?.split("/").pop() || "";
+
+      const productTitle = (n?.product?.title || "").toString().trim();
+      const variantTitle = (n?.title || "").toString().trim();
+
+      // Store product_name as "Product Title - Variant Title" to be useful in Looker
+      const productName =
+        variantTitle && variantTitle !== "Default Title"
+          ? `${productTitle} - ${variantTitle}`
+          : productTitle;
+
+      if (!variantId || !inventoryItemId) continue;
+
+      all.push({ sku, productName, variantId, inventoryItemId });
+    }
+
+    const pageInfo = conn?.pageInfo;
+    if (!pageInfo?.hasNextPage) break;
+    after = pageInfo?.endCursor || null;
+  }
+
+  return all;
+}
+
+async function fetchInventoryLevelsBatch(params: {
+  shopDomain: string;
+  adminToken: string;
+  apiVersion: string;
+  locationId: string;
+  inventoryItemIds: string[];
+}) {
+  const { shopDomain, adminToken, apiVersion, locationId, inventoryItemIds } = params;
+
+  const out = new Map<string, number>();
+
+  // Shopify REST supports multiple inventory_item_ids in a single request.
+  // Chunk to avoid URL length and be gentle on rate limits.
+  const batches = chunk(inventoryItemIds, 50);
+
+  for (const batchIds of batches) {
+    const url = `https://${shopDomain}/admin/api/${apiVersion}/inventory_levels.json?inventory_item_ids=${encodeURIComponent(
+      batchIds.join(",")
+    )}&location_ids=${encodeURIComponent(locationId)}`;
+
+    const res = await fetch(url, {
       headers: {
         "X-Shopify-Access-Token": adminToken,
         "Content-Type": "application/json",
       },
+    });
+
+    if (!res.ok) {
+      // If a batch fails, set them to 0 rather than killing the whole run
+      for (const id of batchIds) out.set(id, 0);
+      continue;
     }
-  );
 
-  if (!res.ok) return 0;
+    const json = (await res.json()) as any;
+    const levels = json?.inventory_levels || [];
 
-  const json = (await res.json()) as any;
+    for (const lvl of levels) {
+      const invItemId = String(lvl?.inventory_item_id || "");
+      const locId = String(lvl?.location_id || "");
+      const avail = lvl?.available;
 
-  const level = (json?.inventory_levels || []).find(
-    (l: any) => String(l.location_id) === String(locationId)
-  );
+      if (locId === String(locationId) && invItemId) {
+        out.set(invItemId, typeof avail === "number" ? avail : 0);
+      }
+    }
 
-  return typeof level?.available === "number" ? level.available : 0;
+    // Any inventory item not returned by the endpoint is effectively 0 at that location
+    for (const id of batchIds) {
+      if (!out.has(id)) out.set(id, 0);
+    }
+  }
+
+  return out;
 }
 
 export async function POST(req: Request) {
   try {
-    // --- Security check ---
+    // Security check
     const secret = req.headers.get("x-cron-secret");
     if (!secret || secret !== process.env.CRON_SECRET) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // --- Required env vars ---
+    // Required env vars
     const GOOGLE_SHEET_ID = requireEnv("GOOGLE_SHEET_ID");
     const GOOGLE_CLIENT_EMAIL = requireEnv("GOOGLE_CLIENT_EMAIL");
-    const GOOGLE_PRIVATE_KEY = requireEnv("GOOGLE_PRIVATE_KEY").replace(
-      /\\n/g,
-      "\n"
-    );
+    const GOOGLE_PRIVATE_KEY = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
 
     const SHOPIFY_STORE_DOMAIN = requireEnv("SHOPIFY_STORE_DOMAIN");
     const SHOPIFY_ADMIN_TOKEN = requireEnv("SHOPIFY_ADMIN_TOKEN");
@@ -212,7 +268,7 @@ export async function POST(req: Request) {
     const snapshotTs = getETTimestamp();
     const runId = `${snapshotDate}-${Date.now()}`;
 
-    // --- Google Sheets auth ---
+    // Google Sheets auth
     const auth = new google.auth.JWT({
       email: GOOGLE_CLIENT_EMAIL,
       key: GOOGLE_PRIVATE_KEY,
@@ -221,15 +277,13 @@ export async function POST(req: Request) {
         "https://www.googleapis.com/auth/drive.file",
       ],
     });
-
     const sheets = google.sheets({ version: "v4", auth });
 
-    // --- Skip if today's snapshot already exists ---
+    // Skip if today's snapshot already exists
     const existingDates = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: `${SNAPSHOT_SHEET}!A:A`,
     });
-
     const dateCol = existingDates.data.values?.flat() || [];
     if (dateCol.includes(snapshotDate)) {
       return NextResponse.json({
@@ -239,7 +293,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // --- Read SKU definitions (with headers) ---
+    // Read Summary (tracked SKUs) and build a map keyed by SKU
     const skuSheet = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: SKU_DEFS_RANGE,
@@ -257,17 +311,19 @@ export async function POST(req: Request) {
     const headerMap = buildHeaderIndexMap(headerRow);
     const rows = all.slice(1);
 
-    // Fallback indexes if headers change unexpectedly
+    // Fallback indexes (your sheet was weird earlier, keep these as safety)
     const FALLBACK = {
-      colorway: 3,
-      size: 4,
-      class: 12,
-      safety: 14,
-      sku: 17,
+      colorway: 2, // C
+      size: 3, // D
+      class: 12, // M
+      safety: 14, // O
+      sku: 17, // R
     };
 
-    const snapshotRows: any[] = [];
-    const errors: Array<{ sku: string; stage: string; detail: string }> = [];
+    const trackedBySku = new Map<
+      string,
+      { colorway: string; size: string; classValue: string; safetyStock: number }
+    >();
 
     for (const r of rows) {
       const sku = (getByHeader(r, headerMap, ["sku"], FALLBACK.sku) || "")
@@ -275,9 +331,7 @@ export async function POST(req: Request) {
         .trim();
       if (!sku) continue;
 
-      const colorway = (
-        getByHeader(r, headerMap, ["colorway"], FALLBACK.colorway) || ""
-      )
+      const colorway = (getByHeader(r, headerMap, ["colorway"], FALLBACK.colorway) || "")
         .toString()
         .trim();
 
@@ -300,79 +354,87 @@ export async function POST(req: Request) {
       );
       const safetyStock = Number(safetyStockRaw || 0) || 0;
 
-      const sizeClass = deriveSizeClassFromSize(size);
+      trackedBySku.set(sku, { colorway, size, classValue, safetyStock });
+    }
 
-      const productClassWeight = PRODUCT_CLASS_WEIGHT[classValue] ?? 0;
-      const sizeClassWeight = SIZE_CLASS_WEIGHT[sizeClass] ?? 0;
-      const totalWeight = productClassWeight * sizeClassWeight;
+    // Pull full catalog variants from Shopify
+    const variants = await fetchAllVariants({
+      shopDomain: SHOPIFY_STORE_DOMAIN,
+      adminToken: SHOPIFY_ADMIN_TOKEN,
+      apiVersion: SHOPIFY_API_VERSION,
+    });
 
-      // --- Find variant + inventory item by SKU ---
-      const variantInfo = await fetchVariantBySkuGraphQL({
-        shopDomain: SHOPIFY_STORE_DOMAIN,
-        adminToken: SHOPIFY_ADMIN_TOKEN,
-        apiVersion: SHOPIFY_API_VERSION,
-        sku,
-      });
+    // Batch fetch inventory for all inventory item IDs for the location
+    const inventoryItemIds = variants.map((v) => v.inventoryItemId);
+    const invMap = await fetchInventoryLevelsBatch({
+      shopDomain: SHOPIFY_STORE_DOMAIN,
+      adminToken: SHOPIFY_ADMIN_TOKEN,
+      apiVersion: SHOPIFY_API_VERSION,
+      locationId: SHOPIFY_LOCATION_ID,
+      inventoryItemIds,
+    });
 
-      if (!variantInfo) {
-        errors.push({
-          sku,
-          stage: "variant_lookup",
-          detail: `Variant not found by SKU via GraphQL (query sku:"${sku}")`,
-        });
-        continue;
-      }
+    // Build snapshot rows for ALL variants
+    const snapshotRows: any[] = [];
+    const errors: Array<{ sku: string; stage: string; detail: string }> = [];
 
-      const { variantId, inventoryItemId } = variantInfo;
+    for (const v of variants) {
+      const tracked = trackedBySku.get(v.sku);
 
-      // --- Fetch inventory available at the chosen location ---
-      const availableQty = await fetchAvailableInventoryREST({
-        shopDomain: SHOPIFY_STORE_DOMAIN,
-        adminToken: SHOPIFY_ADMIN_TOKEN,
-        apiVersion: SHOPIFY_API_VERSION,
-        inventoryItemId,
-        locationId: SHOPIFY_LOCATION_ID,
-      });
+      const classValue = tracked?.classValue || "";
+      const safetyStock = tracked?.safetyStock ?? 0;
 
-      // --- Heatmap metric support ---
-      // This is the best heatmap signal because it includes safety stock context
-      const balanceVsSafety = availableQty - safetyStock;
+      // Only populate these if tracked, otherwise blank
+      const colorway = tracked ? tracked.colorway : "";
+      const size = tracked ? tracked.size : "";
+      const sizeClass = tracked ? deriveSizeClassFromSize(size) : "";
 
-      // --- Andries binary scoring (stock position) ---
-      // If safety stock exists: "in stock" only if we meet or exceed safety
-      // If no safety stock: "in stock" only if available > 0
-      const inStockBinary =
-        safetyStock > 0 ? availableQty >= safetyStock : availableQty > 0;
+      // Weights only apply to tracked SKUs
+      const productClassWeight = tracked ? PRODUCT_CLASS_WEIGHT[classValue] ?? 0 : 0;
+      const sizeClassWeight = tracked ? SIZE_CLASS_WEIGHT[sizeClass as "A" | "B"] ?? 0 : 0;
+      const totalWeight = tracked ? productClassWeight * sizeClassWeight : 0;
+
+      const availableQty = invMap.get(v.inventoryItemId) ?? 0;
+
+      // Heatmap metric (recommended)
+      const balanceVsSafety = tracked ? availableQty - safetyStock : 0;
+
+      // Binary scoring uses safety stock when defined (your current scoring approach)
+      const inStockBinary = tracked
+        ? safetyStock > 0
+          ? availableQty >= safetyStock
+          : availableQty > 0
+        : false;
 
       const inStockFlag = inStockBinary ? 1 : 0;
-
-      // Numerator contribution per SKU (X)
       const weightedInStock = inStockFlag * totalWeight;
 
       snapshotRows.push([
         snapshotDate, // A snapshot_date_et
         snapshotTs, // B snapshot_ts_et
         runId, // C run_id
-        sku, // D sku
-        colorway, // E colorway
-        size, // F size
-        classValue, // G class
-        sizeClass, // H size_class
-        safetyStock, // I safety_stock
-        variantId, // J shopify_variant_id
-        inventoryItemId, // K inventory_item_id
-        SHOPIFY_LOCATION_ID, // L location_id
-        availableQty, // M available_qty (for your old inventory-sum heatmap)
-        balanceVsSafety, // N balance_vs_safety (recommended heatmap metric)
-        productClassWeight, // O product_class_weight
-        sizeClassWeight, // P size_class_weight
-        totalWeight, // Q total_weight (denominator piece)
-        inStockFlag, // R in_stock_flag
-        weightedInStock, // S weighted_in_stock (numerator piece)
+        v.sku, // D sku
+        v.productName, // E product_name
+        colorway, // F colorway (blank if untracked)
+        size, // G size (blank if untracked)
+        classValue, // H class (blank if untracked)
+        sizeClass, // I size_class (blank if untracked)
+        safetyStock, // J safety_stock (0 if untracked)
+        v.variantId, // K shopify_variant_id
+        v.inventoryItemId, // L inventory_item_id
+        SHOPIFY_LOCATION_ID, // M location_id
+        availableQty, // N available_qty
+        balanceVsSafety, // O balance_vs_safety (0 if untracked)
+        productClassWeight, // P product_class_weight
+        sizeClassWeight, // Q size_class_weight
+        totalWeight, // R total_weight
+        inStockFlag, // S in_stock_flag
+        weightedInStock, // T weighted_in_stock
+        tracked ? 1 : 0, // U is_tracked
       ]);
     }
 
-    // --- Append rows ---
+    // Append rows
     if (snapshotRows.length) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: GOOGLE_SHEET_ID,
@@ -386,6 +448,7 @@ export async function POST(req: Request) {
       status: "ok",
       snapshotDate,
       rowsInserted: snapshotRows.length,
+      trackedCount: variants.filter((v) => trackedBySku.has(v.sku)).length,
       errorsCount: errors.length,
       errors: errors.slice(0, 25),
     });
@@ -397,7 +460,6 @@ export async function POST(req: Request) {
   }
 }
 
-// Optional: explicitly block GET
 export async function GET() {
   return NextResponse.json({ error: "Method not allowed" }, { status: 405 });
 }
