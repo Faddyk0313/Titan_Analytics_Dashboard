@@ -2,7 +2,9 @@ import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
 const TZ = "America/New_York";
-const SKU_DEFS_RANGE = "Summary!A2:Z";
+
+// Include header row so we can map columns safely
+const SKU_DEFS_RANGE = "Summary!A1:Z";
 const SNAPSHOT_SHEET = "inventory_snapshots";
 
 function getETDate() {
@@ -31,6 +33,67 @@ function requireEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
+}
+
+function normalizeHeader(h: string) {
+  return h
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+function buildHeaderIndexMap(headerRow: any[]) {
+  const map: Record<string, number> = {};
+  for (let i = 0; i < headerRow.length; i++) {
+    const key = normalizeHeader(headerRow[i] ?? "");
+    if (key) map[key] = i;
+  }
+  return map;
+}
+
+function getByHeader(
+  row: any[],
+  headerMap: Record<string, number>,
+  keys: string[],
+  fallbackIndex?: number
+) {
+  for (const k of keys) {
+    const idx = headerMap[k];
+    if (typeof idx === "number") return row?.[idx];
+  }
+  if (typeof fallbackIndex === "number") return row?.[fallbackIndex];
+  return undefined;
+}
+
+// Andries product class weights
+const PRODUCT_CLASS_WEIGHT: Record<string, number> = {
+  A: 4,
+  B: 3,
+  C: 2,
+  LE: 1,
+};
+
+// Andries size class weights
+const SIZE_CLASS_WEIGHT: Record<string, number> = {
+  A: 3,
+  B: 1,
+};
+
+// Derive Size Class from Size because Summary does not have a Size Class column
+const SIZE_CLASS_A_SET = new Set([
+  "YTH-MD",
+  "YTH-LG",
+  "YTH-XL",
+  "SR-SM",
+  "SR-MD",
+  "SR-LG",
+]);
+
+function deriveSizeClassFromSize(sizeRaw: string): "A" | "B" {
+  const size = (sizeRaw || "").toString().trim().toUpperCase();
+  return SIZE_CLASS_A_SET.has(size) ? "A" : "B";
 }
 
 // More reliable than /variants.json?sku=... : use Admin GraphQL search query by SKU
@@ -70,14 +133,11 @@ async function fetchVariantBySkuGraphQL(params: {
       body: JSON.stringify({ query, variables }),
     }
   );
-  
 
-  // if (!res.ok) return null;
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Shopify GraphQL error ${res.status}: ${text}`);
   }
-  
 
   const json = (await res.json()) as any;
   const edge = json?.data?.productVariants?.edges?.[0];
@@ -88,7 +148,6 @@ async function fetchVariantBySkuGraphQL(params: {
 
   if (!variantGid || !invItemGid) return null;
 
-  // Convert gid://shopify/ProductVariant/123 -> 123
   const variantId = variantGid.split("/").pop()!;
   const inventoryItemId = invItemGid.split("/").pop()!;
 
@@ -121,7 +180,6 @@ async function fetchAvailableInventoryREST(params: {
 
   const json = (await res.json()) as any;
 
-  // Safer than [0]
   const level = (json?.inventory_levels || []).find(
     (l: any) => String(l.location_id) === String(locationId)
   );
@@ -150,8 +208,8 @@ export async function POST(req: Request) {
     const SHOPIFY_API_VERSION = requireEnv("SHOPIFY_API_VERSION");
     const SHOPIFY_LOCATION_ID = requireEnv("SHOPIFY_LOCATION_ID");
 
-    const snapshotDate = getETDate(); // YYYY-MM-DD (ET)
-    const snapshotTs = getETTimestamp(); // YYYY-MM-DD HH:mm:ss (ET)
+    const snapshotDate = getETDate();
+    const snapshotTs = getETTimestamp();
     const runId = `${snapshotDate}-${Date.now()}`;
 
     // --- Google Sheets auth ---
@@ -166,7 +224,7 @@ export async function POST(req: Request) {
 
     const sheets = google.sheets({ version: "v4", auth });
 
-    // --- Skip if today's snapshot already exists (prevent duplicates) ---
+    // --- Skip if today's snapshot already exists ---
     const existingDates = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: `${SNAPSHOT_SHEET}!A:A`,
@@ -181,44 +239,74 @@ export async function POST(req: Request) {
       });
     }
 
-    // --- Read SKU definitions ---
+    // --- Read SKU definitions (with headers) ---
     const skuSheet = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: SKU_DEFS_RANGE,
     });
 
-    const rows = skuSheet.data.values || [];
+    const all = skuSheet.data.values || [];
+    if (all.length < 2) {
+      return NextResponse.json(
+        { status: "error", message: "Summary sheet has no rows to process" },
+        { status: 500 }
+      );
+    }
 
-    // Column indexes (0-based) for Summary!A2:Z
-    // Confirmed by you:
-    // Colorway C, Size D, Class M, Safety Stock O, SKU R
-    const COL = {
-      colorway: 2, // C
-      size: 3, // D
-      class: 12, // M
-      safety: 14, // O
-      sku: 17, // R
+    const headerRow = all[0];
+    const headerMap = buildHeaderIndexMap(headerRow);
+    const rows = all.slice(1);
+
+    // Fallback indexes if headers change unexpectedly
+    const FALLBACK = {
+      colorway: 3,
+      size: 4,
+      class: 12,
+      safety: 14,
+      sku: 17,
     };
 
     const snapshotRows: any[] = [];
     const errors: Array<{ sku: string; stage: string; detail: string }> = [];
 
     for (const r of rows) {
-      const sku = (r?.[COL.sku] || "").toString().trim();
+      const sku = (getByHeader(r, headerMap, ["sku"], FALLBACK.sku) || "")
+        .toString()
+        .trim();
       if (!sku) continue;
 
-      const colorway = (r?.[COL.colorway] || "").toString().trim();
-      const size = (r?.[COL.size] || "").toString().trim();
-      const classValue = (r?.[COL.class] || "").toString().trim();
+      const colorway = (
+        getByHeader(r, headerMap, ["colorway"], FALLBACK.colorway) || ""
+      )
+        .toString()
+        .trim();
 
-      // Parse safety stock
-      const safetyStockRaw = r?.[COL.safety];
+      const size = (getByHeader(r, headerMap, ["size"], FALLBACK.size) || "")
+        .toString()
+        .trim();
+
+      const classValue = (
+        getByHeader(r, headerMap, ["class"], FALLBACK.class) || ""
+      )
+        .toString()
+        .trim()
+        .toUpperCase();
+
+      const safetyStockRaw = getByHeader(
+        r,
+        headerMap,
+        ["safety_stock", "safety"],
+        FALLBACK.safety
+      );
       const safetyStock = Number(safetyStockRaw || 0) || 0;
 
-      // We still snapshot everything, but weight A/B only
-      const classWeight = classValue === "A" ? 2 : classValue === "B" ? 1 : 0;
+      const sizeClass = deriveSizeClassFromSize(size);
 
-      // --- Find variant + inventory item by SKU (GraphQL) ---
+      const productClassWeight = PRODUCT_CLASS_WEIGHT[classValue] ?? 0;
+      const sizeClassWeight = SIZE_CLASS_WEIGHT[sizeClass] ?? 0;
+      const totalWeight = productClassWeight * sizeClassWeight;
+
+      // --- Find variant + inventory item by SKU ---
       const variantInfo = await fetchVariantBySkuGraphQL({
         shopDomain: SHOPIFY_STORE_DOMAIN,
         adminToken: SHOPIFY_ADMIN_TOKEN,
@@ -246,18 +334,20 @@ export async function POST(req: Request) {
         locationId: SHOPIFY_LOCATION_ID,
       });
 
-      // --- Depth-aware ratio ---
-      // If safety target exists: cap ratio at 1.0
-      // If no safety target: 1 if in stock else 0 (temporary)
-      const depthRatio =
-        safetyStock > 0
-          ? Math.min(availableQty / safetyStock, 1)
-          : availableQty > 0
-          ? 1
-          : 0;
-
+      // --- Heatmap metric support ---
+      // This is the best heatmap signal because it includes safety stock context
       const balanceVsSafety = availableQty - safetyStock;
-      const weightedContribution = depthRatio * classWeight;
+
+      // --- Andries binary scoring (stock position) ---
+      // If safety stock exists: "in stock" only if we meet or exceed safety
+      // If no safety stock: "in stock" only if available > 0
+      const inStockBinary =
+        safetyStock > 0 ? availableQty >= safetyStock : availableQty > 0;
+
+      const inStockFlag = inStockBinary ? 1 : 0;
+
+      // Numerator contribution per SKU (X)
+      const weightedInStock = inStockFlag * totalWeight;
 
       snapshotRows.push([
         snapshotDate, // A snapshot_date_et
@@ -267,15 +357,18 @@ export async function POST(req: Request) {
         colorway, // E colorway
         size, // F size
         classValue, // G class
-        safetyStock, // H safety_stock
-        variantId, // I shopify_variant_id
-        inventoryItemId, // J inventory_item_id
-        SHOPIFY_LOCATION_ID, // K location_id
-        availableQty, // L available_qty
-        balanceVsSafety, // M balance_vs_safety
-        depthRatio, // N depth_ratio
-        classWeight, // O class_weight
-        weightedContribution, // P weighted_contribution
+        sizeClass, // H size_class
+        safetyStock, // I safety_stock
+        variantId, // J shopify_variant_id
+        inventoryItemId, // K inventory_item_id
+        SHOPIFY_LOCATION_ID, // L location_id
+        availableQty, // M available_qty (for your old inventory-sum heatmap)
+        balanceVsSafety, // N balance_vs_safety (recommended heatmap metric)
+        productClassWeight, // O product_class_weight
+        sizeClassWeight, // P size_class_weight
+        totalWeight, // Q total_weight (denominator piece)
+        inStockFlag, // R in_stock_flag
+        weightedInStock, // S weighted_in_stock (numerator piece)
       ]);
     }
 
@@ -294,7 +387,7 @@ export async function POST(req: Request) {
       snapshotDate,
       rowsInserted: snapshotRows.length,
       errorsCount: errors.length,
-      errors: errors.slice(0, 25), // keep response small
+      errors: errors.slice(0, 25),
     });
   } catch (err: any) {
     return NextResponse.json(
