@@ -409,6 +409,10 @@ export async function POST(req: Request) {
       const inStockFlag = inStockBinary ? 1 : 0;
       const weightedInStock = inStockFlag * totalWeight;
 
+      // v2 scoring: in stock if available_qty > 0 (tracked only)
+      const inStockAnyFlag = tracked && availableQty > 0 ? 1 : 0;
+      const weightedInStockAny = inStockAnyFlag * totalWeight;
+
       snapshotRows.push([
         snapshotDate, // A snapshot_date_et
         snapshotTs, // B snapshot_ts_et
@@ -428,9 +432,11 @@ export async function POST(req: Request) {
         productClassWeight, // P product_class_weight
         sizeClassWeight, // Q size_class_weight
         totalWeight, // R total_weight
-        inStockFlag, // S in_stock_flag
-        weightedInStock, // T weighted_in_stock
+        inStockFlag, // S in_stock_flag (v1)
+        weightedInStock, // T weighted_in_stock (v1)
         tracked ? 1 : 0, // U is_tracked
+        inStockAnyFlag, // V in_stock_any_flag (v2)
+        weightedInStockAny, // W weighted_in_stock_any (v2)
       ]);
     }
 
