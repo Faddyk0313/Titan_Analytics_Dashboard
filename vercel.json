@@ -1,6 +1,7 @@
 {
   "crons": [{
     "path": "/api/snapshot/inventory",
-    "schedule": "1 0 * * *"
+    "schedule": "40 17 * * *",
+    "timezone": "UTC"
   }]
 }
