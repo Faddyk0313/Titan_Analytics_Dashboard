@@ -1,0 +1,18 @@
+name: Inventory Snapshot Cron
+
+on:
+  schedule:
+    - cron: "40 17 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-inventory-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call inventory snapshot endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -fsS -X POST \
+            https://titan-analytics-dashboard.vercel.app/api/snapshot/inventory \
+            -H "x-cron-secret: ${CRON_SECRET}"
